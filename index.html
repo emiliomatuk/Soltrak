@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Panel de gestión</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #root { background: #0d0d0d; min-height: 100vh; width: 100%; }
+    [draggable] { user-select: none; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const SUPABASE_URL = "https://sskkkaemjfdyjxaotuho.supabase.co";
+    const SUPABASE_KEY = "sb_publishable_0MRlGeIz5fEJQB4Lhd7OQg_3bdqsxI0";
+
+    async function sbFetch(path, options = {}) {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+        ...options,
+        headers: {
+          "apikey": SUPABASE_KEY,
+          "Authorization": `Bearer ${SUPABASE_KEY}`,
+          "Content-Type": "application/json",
+          "Prefer": "return=representation",
+          ...(options.headers || {}),
+        },
+      });
+      const text = await res.text();
+      return text ? JSON.parse(text) : null;
+    }
+
+    async function loadCardsFromDB() {
+      try {
+        const rows = await sbFetch("cards?select=id,data");
+        return rows.map((r) => ({ id: r.id, ...r.data }));
+      } catch { return null; }
+    }
+
+    async function upsertCard(card) {
+      const { id, ...data } = card;
+      try {
+        await sbFetch("cards", {
+          method: "POST",
+          headers: { "Prefer": "resolution=merge-duplicates,return=representation" },
+          body: JSON.stringify({ id, data }),
+        });
+      } catch {}
+    }
+
+    async function deleteCardFromDB(id) {
+      try { await sbFetch(`cards?id=eq.${id}`, { method: "DELETE" }); } catch {}
+    }
+
+    const COLUMNS = [
+      { id: "todo", label: "Pendiente", color: "#A78BFA" },
+      { id: "inprogress", label: "En progreso", color: "#38BDF8" },
+      { id: "done", label: "Listo", color: "#34D399" },
+    ];
+
+    const PRIORITIES = [
+      { id: "high", label: "Alta", color: "#F87171" },
+      { id: "mid", label: "Media", color: "#FBBF24" },
+      { id: "low", label: "Baja", color: "#94A3B8" },
+    ];
+
+    const INITIAL_CARDS = [
+      { id: "init1", col: "inprogress", title: "Comida Safety Expert", desc: "Coordinar el envio y pago del servicio de alimentación para el safety expert. Poner el precio exacto según lo que diga el requerimiento.", priority: "high", due: "2026-11-05", tags: ["3M"], recurring: false, order: 0, createdAt: Date.now() },
+      { id: "init2", col: "inprogress", title: "Lead Manager", desc: "Vaciar cada 4 horas el correo de ventas y conectar leads reales a Bitrix.", priority: "mid", due: "", tags: [], recurring: true, order: 1, createdAt: Date.now() },
+      { id: "init3", col: "inprogress", title: "SAP", desc: "Creación de todo lo relacionado a SAP (solpeds, HES, ES, MIGO).", priority: "mid", due: "", tags: [], recurring: true, order: 2, createdAt: Date.now() },
+      { id: "init4", col: "inprogress", title: "La Merced", desc: "Gestionar facturas y poner precio exacto segun serv.", priority: "low", due: "2026-05-15", tags: ["3M"], recurring: false, order: 3, createdAt: Date.now() },
+    ];
+
+    function genId() { return Math.random().toString(36).slice(2, 9); }
+
+    function checkDailyReset(cards) {
+      const today = new Date().toISOString().slice(0, 10);
+      const last = localStorage.getItem("kanban_last_reset");
+      if (last !== today) {
+        localStorage.setItem("kanban_last_reset", today);
+        return cards.map((c) => c.recurring && c.col !== "todo" ? { ...c, col: "todo" } : c);
+      }
+      return cards;
+    }
+
+    function PriorityDot({ priority }) {
+      const p = PRIORITIES.find((x) => x.id === priority) || PRIORITIES[2];
+      return <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: p.color, flexShrink: 0 }} />;
+    }
+
+    function Tag({ label, onRemove }) {
+      return (
+        <span style={{ fontSize: 11, padding: "2px 7px", borderRadius: 99, background: "rgba(167,139,250,0.18)", color: "#C4B5FD", display: "inline-flex", alignItems: "center", gap: 4, fontFamily: "'DM Mono', monospace" }}>
+          {label}
+          {onRemove && <span onClick={onRemove} style={{ cursor: "pointer", opacity: 0.6, fontSize: 13 }}>×</span>}
+        </span>
+      );
+    }
+
+    function CardModal({ card, onSave, onClose, onDelete }) {
+      const [title, setTitle] = useState(card?.title || "");
+      const [desc, setDesc] = useState(card?.desc || "");
+      const [priority, setPriority] = useState(card?.priority || "mid");
+      const [due, setDue] = useState(card?.due || "");
+      const [tags, setTags] = useState(card?.tags || []);
+      const [tagInput, setTagInput] = useState("");
+      const [recurring, setRecurring] = useState(card?.recurring || false);
+
+      function handleTagKey(e) {
+        if ((e.key === "Enter" || e.key === ",") && tagInput.trim()) {
+          e.preventDefault();
+          const t = tagInput.trim().replace(/,/g, "");
+          if (t && !tags.includes(t)) setTags([...tags, t]);
+          setTagInput("");
+        }
+      }
+
+      function submit() {
+        if (!title.trim()) return;
+        onSave({ title: title.trim(), desc, priority, due, tags, recurring });
+      }
+
+      return (
+        <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ background: "#141414", border: "1px solid #2e2e2e", borderRadius: 16, padding: "28px 28px 24px", width: "min(480px, 92vw)", display: "flex", flexDirection: "column", gap: 18, boxShadow: "0 32px 80px rgba(0,0,0,0.6)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: 13, color: "#9CA3AF", fontFamily: "'DM Mono', monospace", letterSpacing: "0.08em" }}>{card?.id ? "EDITAR TAREA" : "NUEVA TAREA"}</span>
+              <button onClick={onClose} style={{ background: "none", border: "none", color: "#9CA3AF", cursor: "pointer", fontSize: 20, padding: 0 }}>×</button>
+            </div>
+            <input autoFocus value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Título de la tarea..." onKeyDown={(e) => e.key === "Enter" && submit()}
+              style={{ background: "transparent", border: "none", borderBottom: "1px solid #2a2a2a", color: "#f0f0f0", fontSize: 20, fontFamily: "'Instrument Serif', serif", padding: "4px 0 10px", outline: "none", width: "100%" }} />
+            <textarea value={desc} onChange={(e) => setDesc(e.target.value)} placeholder="Descripción (opcional)..." rows={2}
+              style={{ background: "#1e1e1e", border: "1px solid #2e2e2e", borderRadius: 8, color: "#D1D5DB", fontSize: 13, fontFamily: "inherit", padding: "10px 12px", outline: "none", resize: "none", width: "100%", boxSizing: "border-box" }} />
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+              <div>
+                <label style={{ fontSize: 11, color: "#9CA3AF", display: "block", marginBottom: 6, fontFamily: "'DM Mono', monospace", letterSpacing: "0.06em" }}>PRIORIDAD</label>
+                <div style={{ display: "flex", gap: 6 }}>
+                  {PRIORITIES.map((p) => (
+                    <button key={p.id} onClick={() => setPriority(p.id)}
+                      style={{ flex: 1, padding: "6px 0", borderRadius: 6, cursor: "pointer", fontSize: 11, fontFamily: "'DM Mono', monospace", background: priority === p.id ? p.color + "22" : "transparent", border: `1px solid ${priority === p.id ? p.color : "#2a2a2a"}`, color: priority === p.id ? p.color : "#666", transition: "all 0.15s" }}>
+                      {p.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <label style={{ fontSize: 11, color: "#9CA3AF", display: "block", marginBottom: 6, fontFamily: "'DM Mono', monospace", letterSpacing: "0.06em" }}>FECHA LÍMITE</label>
+                <input type="date" value={due} onChange={(e) => setDue(e.target.value)}
+                  style={{ background: "#1e1e1e", border: "1px solid #2e2e2e", borderRadius: 6, color: due ? "#E5E7EB" : "#6B7280", fontSize: 12, padding: "7px 10px", outline: "none", width: "100%", boxSizing: "border-box", fontFamily: "inherit" }} />
+              </div>
+            </div>
+            <div>
+              <label style={{ fontSize: 11, color: "#9CA3AF", display: "block", marginBottom: 6, fontFamily: "'DM Mono', monospace", letterSpacing: "0.06em" }}>ETIQUETAS</label>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: tags.length ? 8 : 0 }}>
+                {tags.map((t) => <Tag key={t} label={t} onRemove={() => setTags(tags.filter((x) => x !== t))} />)}
+              </div>
+              <input value={tagInput} onChange={(e) => setTagInput(e.target.value)} onKeyDown={handleTagKey} placeholder="Escribe y presiona Enter..."
+                style={{ background: "#1e1e1e", border: "1px solid #2e2e2e", borderRadius: 6, color: "#D1D5DB", fontSize: 12, padding: "7px 10px", outline: "none", width: "100%", boxSizing: "border-box", fontFamily: "inherit" }} />
+            </div>
+            <div onClick={() => setRecurring(!recurring)}
+              style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: recurring ? "rgba(251,191,36,0.07)" : "#1a1a1a", border: `1px solid ${recurring ? "#78350f" : "#2e2e2e"}`, borderRadius: 10, padding: "12px 14px", cursor: "pointer", transition: "all 0.2s" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontSize: 16 }}>↻</span>
+                <div>
+                  <p style={{ margin: 0, fontSize: 13, color: recurring ? "#FCD34D" : "#9CA3AF", fontFamily: "'DM Mono', monospace" }}>Tarea diaria recurrente</p>
+                  <p style={{ margin: "2px 0 0", fontSize: 11, color: "#4B5563" }}>Se resetea a Pendiente cada nuevo día</p>
+                </div>
+              </div>
+              <div style={{ width: 36, height: 20, borderRadius: 99, background: recurring ? "#FBBF24" : "#2e2e2e", position: "relative", transition: "all 0.2s", flexShrink: 0 }}>
+                <div style={{ position: "absolute", top: 3, left: recurring ? 18 : 3, width: 14, height: 14, borderRadius: "50%", background: recurring ? "#0d0d0d" : "#555", transition: "all 0.2s" }} />
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "space-between", marginTop: 4 }}>
+              {card?.id && <button onClick={onDelete} style={{ background: "transparent", border: "1px solid #3a1a1a", borderRadius: 8, color: "#EF4444", fontSize: 13, padding: "10px 16px", cursor: "pointer", fontFamily: "'DM Mono', monospace" }}>Eliminar</button>}
+              <div style={{ display: "flex", gap: 8, marginLeft: "auto" }}>
+                <button onClick={onClose} style={{ background: "transparent", border: "1px solid #2e2e2e", borderRadius: 8, color: "#9CA3AF", fontSize: 13, padding: "10px 20px", cursor: "pointer", fontFamily: "'DM Mono', monospace" }}>Cancelar</button>
+                <button onClick={submit} disabled={!title.trim()} style={{ background: title.trim() ? "#7C3AED" : "#2a2a2a", border: "none", borderRadius: 8, color: title.trim() ? "#fff" : "#555", fontSize: 13, padding: "10px 24px", cursor: title.trim() ? "pointer" : "default", fontFamily: "'DM Mono', monospace" }}>
+                  {card?.id ? "Guardar" : "Crear tarea"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function KanbanCard({ card, colId, onEdit, onMove, onDragStart, onDragEnter, onDragEnd, isDragging, isOver }) {
+      const prevCols = COLUMNS.filter((c) => c.id !== colId && COLUMNS.indexOf(c) < COLUMNS.findIndex((x) => x.id === colId));
+      const nextCols = COLUMNS.filter((c) => c.id !== colId && COLUMNS.indexOf(c) > COLUMNS.findIndex((x) => x.id === colId));
+      const isOverdue = card.due && new Date(card.due) < new Date() && colId !== "done";
+      return (
+        <div draggable onDragStart={() => onDragStart(card.id)} onDragEnter={() => onDragEnter(card.id)} onDragEnd={onDragEnd} onDragOver={(e) => e.preventDefault()} onClick={() => !isDragging && onEdit(card)}
+          style={{ background: "#1a1a1a", border: `1px solid ${isOver ? "#A78BFA" : "#2a2a2a"}`, borderRadius: 12, padding: "14px 14px 12px", cursor: "grab", transition: "all 0.15s", opacity: isDragging ? 0.4 : 1, transform: isOver ? "scale(1.01)" : "none", boxShadow: isOver ? "0 0 0 2px rgba(167,139,250,0.3)" : "none" }}
+          onMouseEnter={(e) => { if (!isDragging) { e.currentTarget.style.borderColor = "#3f3f3f"; e.currentTarget.style.transform = "translateY(-1px)"; }}}
+          onMouseLeave={(e) => { e.currentTarget.style.borderColor = isOver ? "#A78BFA" : "#2a2a2a"; e.currentTarget.style.transform = "none"; }}>
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 8, marginBottom: 8 }}>
+            <PriorityDot priority={card.priority} />
+            <span style={{ fontSize: 14, color: colId === "done" ? "#6B7280" : "#F3F4F6", fontFamily: "'Instrument Serif', serif", lineHeight: 1.3, flex: 1, textDecoration: colId === "done" ? "line-through" : "none" }}>{card.title}</span>
+            {card.recurring && <span style={{ fontSize: 12, color: "#FBBF24", flexShrink: 0 }}>↻</span>}
+          </div>
+          {card.desc && <p style={{ fontSize: 12, color: "#9CA3AF", margin: "0 0 8px 16px", lineHeight: 1.4, fontStyle: "italic" }}>{card.desc}</p>}
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginLeft: 16, marginBottom: (card.due || card.tags?.length) ? 10 : 0 }}>
+            {card.tags?.map((t) => <Tag key={t} label={t} />)}
+          </div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginLeft: 16 }}>
+            {card.due ? <span style={{ fontSize: 11, color: isOverdue ? "#F87171" : "#9CA3AF", fontFamily: "'DM Mono', monospace" }}>{isOverdue ? "⚠ " : ""}{card.due}</span> : <span />}
+            <div style={{ display: "flex", gap: 4 }} onClick={(e) => e.stopPropagation()}>
+              {prevCols.map((c) => (
+                <button key={c.id} onClick={() => onMove(card.id, c.id)} style={{ background: "transparent", border: "1px solid #2e2e2e", borderRadius: 4, color: "#9CA3AF", fontSize: 10, padding: "3px 6px", cursor: "pointer", fontFamily: "'DM Mono', monospace" }}>← {c.label.slice(0,3)}</button>
+              ))}
+              {nextCols.map((c) => (
+                <button key={c.id} onClick={() => onMove(card.id, c.id)} style={{ background: c.id === "done" ? "rgba(52,211,153,0.12)" : "rgba(56,189,248,0.12)", border: `1px solid ${c.id === "done" ? "#065f46" : "#0c4a6e"}`, borderRadius: 4, color: c.id === "done" ? "#34D399" : "#38BDF8", fontSize: 10, padding: "3px 6px", cursor: "pointer", fontFamily: "'DM Mono', monospace" }}>{c.label.slice(0,3)} →</button>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [cards, setCards] = useState([]);
+      const [loaded, setLoaded] = useState(false);
+      const [modal, setModal] = useState(null);
+      const [filter, setFilter] = useState("");
+      const dragCard = useRef(null);
+      const dragOver = useRef(null);
+      const [draggingId, setDraggingId] = useState(null);
+      const [overCardId, setOverCardId] = useState(null);
+
+      useEffect(() => {
+        async function init() {
+          let data = await loadCardsFromDB();
+          if (!data || data.length === 0) {
+            data = INITIAL_CARDS;
+            await Promise.all(data.map(upsertCard));
+          } else {
+            const today = new Date().toISOString().slice(0, 10);
+            const last = localStorage.getItem("kanban_last_reset");
+            if (last !== today) {
+              localStorage.setItem("kanban_last_reset", today);
+              const reset = data.map((c) => c.recurring && c.col !== "todo" ? { ...c, col: "todo" } : c);
+              const changed = reset.filter((c, i) => c.col !== data[i].col);
+              await Promise.all(changed.map(upsertCard));
+              data = reset;
+            }
+          }
+          setCards(data);
+          setLoaded(true);
+        }
+        init();
+      }, []);
+
+      async function persist(next, changed = [], deleted = []) {
+        setCards(next);
+        await Promise.all([...changed.map(upsertCard), ...deleted.map(deleteCardFromDB)]);
+      }
+
+      function openNew(colId) { setModal({ mode: "new", colId, card: { priority: "mid", tags: [] } }); }
+      function openEdit(card) { setModal({ mode: "edit", card }); }
+
+      async function saveCard(data) {
+        if (modal.mode === "new") {
+          const colCards = cards.filter((c) => c.col === modal.colId);
+          const maxOrder = colCards.length ? Math.max(...colCards.map((c) => c.order ?? 0)) + 1 : 0;
+          const newCard = { id: genId(), col: modal.colId, createdAt: Date.now(), order: maxOrder, ...data };
+          await persist([...cards, newCard], [newCard]);
+        } else {
+          const updated = { ...modal.card, ...data };
+          await persist(cards.map((c) => c.id === modal.card.id ? updated : c), [updated]);
+        }
+        setModal(null);
+      }
+
+      async function deleteCard() {
+        await persist(cards.filter((c) => c.id !== modal.card.id), [], [modal.card.id]);
+        setModal(null);
+      }
+
+      async function moveCard(id, toCol) {
+        const colCards = cards.filter((c) => c.col === toCol);
+        const maxOrder = colCards.length ? Math.max(...colCards.map((c) => c.order ?? 0)) + 1 : 0;
+        const updated = cards.map((c) => c.id === id ? { ...c, col: toCol, order: maxOrder } : c);
+        await persist(updated, [updated.find((c) => c.id === id)]);
+      }
+
+      function handleDragStart(id) { dragCard.current = id; setDraggingId(id); }
+      function handleDragEnter(id) { if (id === dragCard.current) return; dragOver.current = id; setOverCardId(id); }
+
+      async function handleDragEnd() {
+        if (!dragCard.current || !dragOver.current || dragCard.current === dragOver.current) {
+          setDraggingId(null); setOverCardId(null); dragCard.current = null; dragOver.current = null; return;
+        }
+        const fromCard = cards.find((c) => c.id === dragCard.current);
+        const toCard = cards.find((c) => c.id === dragOver.current);
+        if (!fromCard || !toCard) return;
+        const colId = toCard.col;
+        let colCards = cards.filter((c) => c.col === colId).sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+        if (fromCard.col !== colId) {
+          const toIdx = colCards.findIndex((c) => c.id === dragOver.current);
+          colCards = colCards.filter((c) => c.id !== dragCard.current);
+          colCards.splice(toIdx, 0, { ...fromCard, col: colId });
+        } else {
+          const fromIdx = colCards.findIndex((c) => c.id === dragCard.current);
+          const toIdx = colCards.findIndex((c) => c.id === dragOver.current);
+          colCards.splice(fromIdx, 1);
+          colCards.splice(toIdx, 0, fromCard);
+        }
+        const reordered = colCards.map((c, i) => ({ ...c, order: i, col: colId }));
+        const others = cards.filter((c) => !reordered.find((r) => r.id === c.id));
+        await persist([...others, ...reordered], reordered);
+        setDraggingId(null); setOverCardId(null); dragCard.current = null; dragOver.current = null;
+      }
+
+      const q = filter.toLowerCase();
+      const filtered = q ? cards.filter((c) => c.title.toLowerCase().includes(q) || c.tags?.some((t) => t.toLowerCase().includes(q)) || c.desc?.toLowerCase().includes(q)) : cards;
+      const total = cards.length;
+      const done = cards.filter((c) => c.col === "done").length;
+      const pct = total ? Math.round((done / total) * 100) : 0;
+
+      if (!loaded) return (
+        <div style={{ minHeight: "100vh", background: "#0d0d0d", display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <div style={{ color: "#9CA3AF", fontFamily: "'DM Mono', monospace", fontSize: 13, display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ display: "inline-block", width: 16, height: 16, border: "2px solid #7C3AED", borderTopColor: "transparent", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+            Cargando tablero...
+          </div>
+        </div>
+      );
+
+      return (
+        <div style={{ minHeight: "100vh", background: "#0d0d0d", color: "#F3F4F6", fontFamily: "'DM Mono', monospace", padding: "0 0 40px" }}>
+          <div style={{ padding: "28px 28px 0", borderBottom: "1px solid #222", paddingBottom: 20, marginBottom: 24 }}>
+            <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+              <div>
+                <h1 style={{ margin: 0, fontSize: 26, fontFamily: "'Instrument Serif', serif", fontWeight: 400, color: "#F9FAFB", letterSpacing: "-0.02em" }}>Panel de gestión</h1>
+                <p style={{ margin: "4px 0 0", fontSize: 12, color: "#6B7280", letterSpacing: "0.05em" }}>{total} TAREAS · {done} COMPLETADAS · {pct}% LISTO</p>
+              </div>
+              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Buscar..."
+                  style={{ background: "#181818", border: "1px solid #2e2e2e", borderRadius: 8, color: "#D1D5DB", fontSize: 12, padding: "8px 14px", outline: "none", fontFamily: "'DM Mono', monospace", width: 160 }} />
+                <button onClick={() => openNew("todo")} style={{ background: "#7C3AED", border: "none", borderRadius: 8, color: "#fff", fontSize: 12, padding: "9px 18px", cursor: "pointer", fontFamily: "'DM Mono', monospace", letterSpacing: "0.05em" }}>+ NUEVA TAREA</button>
+              </div>
+            </div>
+            {total > 0 && (
+              <div style={{ marginTop: 16, height: 3, background: "#222", borderRadius: 99, overflow: "hidden" }}>
+                <div style={{ height: "100%", width: `${pct}%`, background: "linear-gradient(90deg, #A78BFA, #34D399)", borderRadius: 99, transition: "width 0.5s ease" }} />
+              </div>
+            )}
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16, padding: "0 28px" }}>
+            {COLUMNS.map((col) => {
+              const colCards = filtered.filter((c) => c.col === col.id).sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+              return (
+                <div key={col.id} onDragOver={(e) => e.preventDefault()} onDrop={() => { if (dragCard.current && !dragOver.current) { moveCard(dragCard.current, col.id); dragCard.current = null; setDraggingId(null); }}}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ width: 8, height: 8, borderRadius: "50%", background: col.color, display: "inline-block" }} />
+                      <span style={{ fontSize: 11, letterSpacing: "0.1em", color: "#D1D5DB" }}>{col.label.toUpperCase()}</span>
+                      <span style={{ fontSize: 11, background: "#1e1e1e", color: "#9CA3AF", borderRadius: 99, padding: "1px 8px", border: "1px solid #2e2e2e" }}>{colCards.length}</span>
+                    </div>
+                    <button onClick={() => openNew(col.id)} style={{ background: "transparent", border: "1px solid #2e2e2e", borderRadius: 6, color: "#9CA3AF", fontSize: 16, width: 26, height: 26, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", padding: 0 }}>+</button>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10, minHeight: 80 }}>
+                    {colCards.map((card) => (
+                      <KanbanCard key={card.id} card={card} colId={col.id} onEdit={openEdit} onMove={moveCard}
+                        onDragStart={handleDragStart} onDragEnter={handleDragEnter} onDragEnd={handleDragEnd}
+                        isDragging={draggingId === card.id} isOver={overCardId === card.id} />
+                    ))}
+                    {colCards.length === 0 && (
+                      <div onClick={() => openNew(col.id)}
+                        style={{ border: "1px dashed #2a2a2a", borderRadius: 12, padding: "24px 16px", textAlign: "center", color: "#4B5563", fontSize: 12, cursor: "pointer" }}
+                        onMouseEnter={(e) => { e.currentTarget.style.borderColor = "#374151"; e.currentTarget.style.color = "#9CA3AF"; }}
+                        onMouseLeave={(e) => { e.currentTarget.style.borderColor = "#2a2a2a"; e.currentTarget.style.color = "#4B5563"; }}>
+                        + Agregar tarea
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          {modal && <CardModal card={modal.card} onSave={saveCard} onClose={() => setModal(null)} onDelete={modal.mode === "edit" ? deleteCard : undefined} />}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
